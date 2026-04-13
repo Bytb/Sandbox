@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import datetime as dt
 import yfinance as yf
 from scipy.optimize import minimize
-from tqdm import tqdm
 from optimize_functions import CVaR_Ret_Objective, Sharpe_Objective, mcVaR, mcCVaR
 
 def get_data(stocks, start, end, print_stats=True):
@@ -19,60 +18,59 @@ def get_data(stocks, start, end, print_stats=True):
 
     if print_stats:
 
-        print("\n" + "=" * 50)
-        print("           DATA DIAGNOSTICS")
-        print("=" * 50)
+        print("\n" + "=" * 75)
+        print("                            DATA DIAGNOSTICS")
+        print("=" * 75)
 
+        # ================= RETURN STATS =================
         daily_mean = returns.mean()
         annual_mean = daily_mean * 252
         daily_vol = returns.std()
         annual_vol = daily_vol * np.sqrt(252)
         sharpe = annual_mean / annual_vol
 
-        return_df = pd.DataFrame({
-            "Mean Daily Return": daily_mean,
-            "Annual Return": annual_mean,
-            "Annual Volatility": annual_vol,
-            "Sharpe Ratio": sharpe
-        })
-
-        print("\n--- RETURN STATS ---")
-        return_df_print = return_df.copy()
-        return_df_print["Mean Daily Return"] = return_df_print["Mean Daily Return"].map(lambda x: f"{x:.4%}")
-        return_df_print["Annual Return"] = return_df_print["Annual Return"].map(lambda x: f"{x:.2%}")
-        return_df_print["Annual Volatility"] = return_df_print["Annual Volatility"].map(lambda x: f"{x:.2%}")
-        return_df_print["Sharpe Ratio"] = return_df_print["Sharpe Ratio"].map(lambda x: f"{x:.3f}")
-        print(return_df_print)
-
-        dividend_data = []
+        # ================= DIVIDENDS =================
+        div_yield_yearly = []
+        div_yield_quarterly = []
 
         for stock in stocks:
             ticker = yf.Ticker(stock)
-            divs = ticker.dividends
+            divs = ticker.dividends.copy()
+
+            if len(divs) == 0:
+                div_yield_yearly.append(0.0)
+                div_yield_quarterly.append(0.0)
+                continue
 
             if divs.index.tz is not None:
                 divs.index = divs.index.tz_localize(None)
 
             divs = divs[(divs.index >= start) & (divs.index <= end)]
 
-            if len(divs) == 0:
-                dividend_yield = 0.0
-            else:
-                total_div = divs.sum()
-                avg_price = close[stock].mean()
-                dividend_yield = total_div / avg_price
+            price_series = close[stock].copy()
+            price_series = price_series[(price_series.index >= start) & (price_series.index <= end)]
 
-            dividend_data.append(dividend_yield)
+            if len(divs) == 0 or len(price_series) == 0:
+                div_yield_yearly.append(0.0)
+                div_yield_quarterly.append(0.0)
+                continue
 
-        dividend_df = pd.DataFrame({
-            "Dividend Yield": dividend_data
-        }, index=stocks)
+            # Yearly yield: average of yearly (dividends / avg yearly price)
+            divs_y = divs.resample("YE").sum()
+            prices_y = price_series.resample("YE").mean()
+            yearly_yields = (divs_y / prices_y).replace([np.inf, -np.inf], np.nan).dropna()
+            div_yield_yearly.append(yearly_yields.mean() if len(yearly_yields) > 0 else 0.0)
 
-        print("\n--- DIVIDEND STATS ---")
-        dividend_df_print = dividend_df.copy()
-        dividend_df_print["Dividend Yield"] = dividend_df_print["Dividend Yield"].map(lambda x: f"{x:.2%}")
-        print(dividend_df_print)
+            # Quarterly yield: average of quarterly (dividends / avg quarterly price)
+            divs_q = divs.resample("QE").sum()
+            prices_q = price_series.resample("QE").mean()
+            quarterly_yields = (divs_q / prices_q).replace([np.inf, -np.inf], np.nan).dropna()
+            div_yield_quarterly.append(quarterly_yields.mean() if len(quarterly_yields) > 0 else 0.0)
 
+        div_yield_yearly = pd.Series(div_yield_yearly, index=stocks)
+        div_yield_quarterly = pd.Series(div_yield_quarterly, index=stocks)
+
+        # ================= MAX DRAWDOWN =================
         max_dd_list = []
 
         for stock in stocks:
@@ -81,14 +79,35 @@ def get_data(stocks, start, end, print_stats=True):
             drawdown = (price_series - running_max) / running_max
             max_dd_list.append(drawdown.min())
 
-        risk_df = pd.DataFrame({
-            "Max Drawdown": max_dd_list
-        }, index=stocks)
+        max_dd_series = pd.Series(max_dd_list, index=stocks)
 
-        print("\n--- RISK STATS ---")
-        risk_df_print = risk_df.copy()
-        risk_df_print["Max Drawdown"] = risk_df_print["Max Drawdown"].map(lambda x: f"{x:.2%}")
-        print(risk_df_print)
+        # ================= COMBINE =================
+        full_df = pd.DataFrame({
+            "Mean Daily": daily_mean,
+            "Annual Ret": annual_mean,
+            "Volatility": annual_vol,
+            "Sharpe": sharpe,
+            "Div Yld (Y)": div_yield_yearly,
+            "Div Yld (Q)": div_yield_quarterly,
+            "Max DD": max_dd_series
+        })
+
+        # Optional: sort by Sharpe descending
+        # full_df = full_df.sort_values("Sharpe", ascending=False)
+
+        # ================= FORMAT =================
+        full_df_print = full_df.copy()
+
+        full_df_print["Mean Daily"] = full_df_print["Mean Daily"].map(lambda x: f"{x:.4%}")
+        full_df_print["Annual Ret"] = full_df_print["Annual Ret"].map(lambda x: f"{x:.2%}")
+        full_df_print["Volatility"] = full_df_print["Volatility"].map(lambda x: f"{x:.2%}")
+        full_df_print["Sharpe"] = full_df_print["Sharpe"].map(lambda x: f"{x:.3f}")
+        full_df_print["Div Yld (Y)"] = full_df_print["Div Yld (Y)"].map(lambda x: f"{x:.2%}")
+        full_df_print["Div Yld (Q)"] = full_df_print["Div Yld (Q)"].map(lambda x: f"{x:.2%}")
+        full_df_print["Max DD"] = full_df_print["Max DD"].map(lambda x: f"{x:.2%}")
+
+        print("\n--- PORTFOLIO INPUT STATS ---")
+        print(full_df_print.to_string(col_space=12))
 
     return meanReturns, covMatrix
 
@@ -173,45 +192,26 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights='random', projection_le
     if t0 is None:
         t0 = dt.datetime.now()
 
-    opt_maxiter = 100 if optimize else 0
-    total_steps = 6 + opt_maxiter
-
-    pbar = tqdm(total=total_steps, desc="Monte Carlo", unit="step")
-
     # ---------------- SETUP ----------------
-    pbar.set_postfix_str("setup")
     start_date = t0 - dt.timedelta(days=look_back)
-    pbar.update(1)
 
     # ---------------- WEIGHTS ----------------
-    pbar.set_postfix_str("weights")
     if weights == "random":
         weights = np.random.rand(len(stock_tickers))
     else:
         weights = np.array(weights, dtype=float) / 100.0
     weights = weights / np.sum(weights)
-    pbar.update(1)
 
     # ---------------- DATA ----------------
-    pbar.set_postfix_str("downloading data")
-    pbar.clear()
     meanReturns, covMatrix = get_data(stock_tickers, start_date, t0, show_stats)
-    pbar.refresh()
-    pbar.update(1)
 
     # ---------------- PREP ----------------
-    pbar.set_postfix_str("matrix prep")
     meanM = np.full((projection_len, len(weights)), meanReturns).T
-    pbar.update(1)
 
-    pbar.set_postfix_str("cholesky")
     L = np.linalg.cholesky(covMatrix)
-    pbar.update(1)
 
     # ---------------- OPTIMIZATION ----------------
     if optimize:
-        pbar.set_postfix_str("optimizing")
-
         Z_fixed = np.random.normal(size=(num_sims, projection_len, len(weights)))
         lam = 1.0
         n_assets = len(stock_tickers)
@@ -226,28 +226,14 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights='random', projection_le
             objective = Sharpe_Objective
             args = (meanReturns, L, Z_fixed, initial_portfolio, 0.04)
 
-        opt_iter = {"count": 0}
-
-        def callback(xk):
-            if opt_iter["count"] < opt_maxiter:
-                opt_iter["count"] += 1
-                pbar.update(1)
-
         result = minimize(
             objective,
             weights,
             args=args,
             method='SLSQP',
             bounds=bounds,
-            constraints=constraints,
-            callback=callback,
-            options={"maxiter": opt_maxiter}
+            constraints=constraints
         )
-
-        # Fill unused steps
-        remaining = opt_maxiter - opt_iter["count"]
-        if remaining > 0:
-            pbar.update(remaining)
 
         if result.success:
             weights = result.x / np.sum(result.x)
@@ -255,21 +241,14 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights='random', projection_le
             print("Optimization failed:", result.message)
 
     # ---------------- SIMULATION ----------------
-    pbar.set_postfix_str("simulating")
-
     Z = np.random.normal(size=(num_sims, projection_len, len(weights)))
     daily_returns = meanReturns.values[None, None, :] + Z @ L.T
     portfolio_returns = daily_returns @ weights
     portfolio_sims = initial_portfolio * np.cumprod(1 + portfolio_returns, axis=1).T
 
-    pbar.update(1)
-
     # ---------------- CLEAN OUTPUT ----------------
     if show_stats:
-        # ---------------- STATS ----------------
-        pbar.set_postfix_str("finalizing")
         stats = print_portfolio_stats(portfolio_sims, initial_portfolio, alpha=alpha, print_stats=False)
-        pbar.update(1)
         print("\n" + "="*35)
         print("     PORTFOLIO WEIGHTS")
         print("="*35)
@@ -290,8 +269,6 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights='random', projection_le
         print(f"Expected Percent Return:     {stats['percent_return']:.2f}%")
         print(f"Probability of Profit:       {stats['percent_profit']:.2f}%")
 
-    # 🔥 CLOSE BAR BEFORE PRINTING
-    pbar.close()
     if show_plots:
         plot_portfolio_results(
             portfolio_sims,
