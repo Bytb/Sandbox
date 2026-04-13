@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import datetime as dt
 import yfinance as yf
 from scipy.optimize import minimize
-
-from optimize_functions import *
+from tqdm import tqdm
+from optimize_functions import CVaR_Ret_Objective, Sharpe_Objective, mcVaR, mcCVaR
 
 def get_data(stocks, start, end):
   stockData = yf.download(stocks, start, end, auto_adjust=False)
@@ -16,7 +16,7 @@ def get_data(stocks, start, end):
   covMatrix = returns.cov()
   return meanReturns, covMatrix
 
-def print_portfolio_stats(portfolio_sims, initialPortfolio, alpha=5, rf=0.04):
+def print_portfolio_stats(portfolio_sims, initialPortfolio, alpha=5, rf=0.04, print_stats=True):
     portResults = pd.Series(portfolio_sims[-1, :])
 
     VaR = initialPortfolio - mcVaR(portResults, alpha=alpha)
@@ -36,14 +36,15 @@ def print_portfolio_stats(portfolio_sims, initialPortfolio, alpha=5, rf=0.04):
 
     sharpe = (mean_ret - rf) / std_ret if std_ret > 1e-12 else 0
 
-    print('Sharpe Ratio {:.4f}'.format(sharpe))
-    print('VaR ${}'.format(round(VaR, 2)))
-    print('CVaR ${}'.format(round(CVaR, 2)))
-    print('Mean ${}'.format(round(mean_line, 2)))
-    print('Standard deviation ${}'.format(round(std_line, 2)))
-    print('Expected Total Return ${}'.format(round(total_return, 2)))
-    print('Expected Percent Return {}%'.format(round(percent_return, 2)))
-    print('Expected Percent of Making a Profit {}%'.format(round(percent_profit, 2)))
+    if print_stats:
+        print('Sharpe Ratio {:.4f}'.format(sharpe))
+        print('VaR ${}'.format(round(VaR, 2)))
+        print('CVaR ${}'.format(round(CVaR, 2)))
+        print('Mean ${}'.format(round(mean_line, 2)))
+        print('Standard deviation ${}'.format(round(std_line, 2)))
+        print('Expected Total Return ${}'.format(round(total_return, 2)))
+        print('Expected Percent Return {}%'.format(round(percent_return, 2)))
+        print('Expected Percent of Making a Profit {}%'.format(round(percent_profit, 2)))
 
     return {
         "portResults": portResults,
@@ -89,76 +90,138 @@ def plot_portfolio_results(portfolio_sims, initialPortfolio, percentile_line, me
 
 def MonteCarlo(initial_portfolio, stock_tickers, weights, projection_len=365,
                t0=None, look_back=365, alpha=5, num_sims=1000,
-               optimize=False, allow_short=False, use_CVaR=False):
+               min_allocation=0, max_allocation=40,
+               optimize=False, method="CVaR", show_stats=True,
+               show_plots=True):
 
     if t0 is None:
         t0 = dt.datetime.now()
 
-    start_date = t0 - dt.timedelta(days=look_back)
+    opt_maxiter = 100 if optimize else 0
+    total_steps = 6 + opt_maxiter
 
+    pbar = tqdm(total=total_steps, desc="Monte Carlo", unit="step")
+
+    # ---------------- SETUP ----------------
+    pbar.set_postfix_str("setup")
+    start_date = t0 - dt.timedelta(days=look_back)
+    pbar.update(1)
+
+    # ---------------- WEIGHTS ----------------
+    pbar.set_postfix_str("weights")
     if weights == "random":
         weights = np.random.rand(len(stock_tickers))
     else:
         weights = np.array(weights, dtype=float) / 100.0
-
     weights = weights / np.sum(weights)
+    pbar.update(1)
 
-    portfolio_sims = np.full((projection_len, num_sims), 0.0)
+    # ---------------- DATA ----------------
+    pbar.set_postfix_str("downloading data")
     meanReturns, covMatrix = get_data(stock_tickers, start_date, t0)
+    pbar.update(1)
 
-    meanM = np.full((projection_len, len(weights)), meanReturns)
-    meanM = meanM.T
+    # ---------------- PREP ----------------
+    pbar.set_postfix_str("matrix prep")
+    meanM = np.full((projection_len, len(weights)), meanReturns).T
+    pbar.update(1)
 
+    pbar.set_postfix_str("cholesky")
     L = np.linalg.cholesky(covMatrix)
+    pbar.update(1)
 
+    # ---------------- OPTIMIZATION ----------------
     if optimize:
+        pbar.set_postfix_str("optimizing")
+
         Z_fixed = np.random.normal(size=(num_sims, projection_len, len(weights)))
         lam = 1.0
         n_assets = len(stock_tickers)
 
         constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1}]
+        bounds = [(min_allocation/100, max_allocation/100) for _ in range(n_assets)]
 
-        if allow_short:
-            bounds = [(-0.2, 0.4) for _ in range(n_assets)]
+        if method == "CVaR":
+            objective = CVaR_Ret_Objective
+            args = (meanReturns, L, Z_fixed, initial_portfolio, lam)
         else:
-            bounds = [(0, 0.4) for _ in range(n_assets)]
+            objective = Sharpe_Objective
+            args = (meanReturns, L, Z_fixed, initial_portfolio, 0.04)
 
-        objective = CVaR_Ret_Objective if use_CVaR else Sharpe_Objective
+        opt_iter = {"count": 0}
+
+        def callback(xk):
+            if opt_iter["count"] < opt_maxiter:
+                opt_iter["count"] += 1
+                pbar.update(1)
 
         result = minimize(
             objective,
             weights,
-            args=(meanReturns, L, Z_fixed, initial_portfolio, lam),
+            args=args,
             method='SLSQP',
             bounds=bounds,
-            constraints=constraints
+            constraints=constraints,
+            callback=callback,
+            options={"maxiter": opt_maxiter}
         )
 
+        # Fill unused steps
+        remaining = opt_maxiter - opt_iter["count"]
+        if remaining > 0:
+            pbar.update(remaining)
 
-
-        if not result.success:
-            print("Optimization failed:", result.message)
-        else:
+        if result.success:
             weights = result.x / np.sum(result.x)
-            print("\nOptimal Weights (%):")
-            for stock, w in zip(stock_tickers, weights):
-                print(f"{stock}: {w * 100:.2f}%")
+        else:
+            print("Optimization failed:", result.message)
 
-    portfolio_sims = np.full((projection_len, num_sims), 0.0)
+    # ---------------- SIMULATION ----------------
+    pbar.set_postfix_str("simulating")
 
-    for m in range(num_sims):
-        Z = np.random.normal(size=(projection_len, len(weights)))
-        dailyReturns = meanM + np.inner(L, Z)
-        portfolio_sims[:, m] = np.cumprod(np.inner(weights, dailyReturns.T) + 1) * initial_portfolio
+    Z = np.random.normal(size=(num_sims, projection_len, len(weights)))
+    daily_returns = meanReturns.values[None, None, :] + Z @ L.T
+    portfolio_returns = daily_returns @ weights
+    portfolio_sims = initial_portfolio * np.cumprod(1 + portfolio_returns, axis=1).T
 
-    stats = print_portfolio_stats(portfolio_sims, initial_portfolio, alpha=alpha)
-    plot_portfolio_results(
-        portfolio_sims,
-        initial_portfolio,
-        stats['percentile_line'],
-        stats['mean_line'],
-        stats['portResults'],
-        alpha=alpha
-    )
+    pbar.update(1)
+
+    # ---------------- CLEAN OUTPUT ----------------
+    if show_stats:
+        # ---------------- STATS ----------------
+        pbar.set_postfix_str("finalizing")
+        stats = print_portfolio_stats(portfolio_sims, initial_portfolio, alpha=alpha, print_stats=False)
+        pbar.update(1)
+        print("\n" + "="*35)
+        print("     OPTIMAL PORTFOLIO")
+        print("="*35)
+
+        for stock, w in zip(stock_tickers, weights):
+            print(f"{stock:<6}: {w*100:>6.2f}%")
+
+        print("\n" + "="*35)
+        print("     PERFORMANCE METRICS")
+        print("="*35)
+
+        print(f"Sharpe Ratio:                {stats['sharpe']:.4f}")
+        print(f"VaR:                         ${stats['VaR']:.2f}")
+        print(f"CVaR:                        ${stats['CVaR']:.2f}")
+        print(f"Mean Portfolio Value:        ${stats['mean_line']:.2f}")
+        print(f"Std Dev:                     ${stats['std_line']:.2f}")
+        print(f"Expected Total Return:       ${stats['total_return']:.2f}")
+        print(f"Expected Percent Return:     {stats['percent_return']:.2f}%")
+        print(f"Probability of Profit:       {stats['percent_profit']:.2f}%")
+
+    # 🔥 CLOSE BAR BEFORE PRINTING
+    pbar.close()
+    if show_plots:
+        plot_portfolio_results(
+            portfolio_sims,
+            initial_portfolio,
+            stats['percentile_line'],
+            stats['mean_line'],
+            stats['portResults'],
+            alpha=alpha
+        )
 
     return portfolio_sims

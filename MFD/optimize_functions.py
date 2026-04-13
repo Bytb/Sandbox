@@ -1,29 +1,9 @@
 from montecarlo_functions import *
 import numpy as np
 
-def CVaR_Ret_Objective(weights, meanReturns, L, Z_fixed, initialPortfolio, lam):
-    weights = np.array(weights)
-    weights = np.clip(weights, 0, 1)
-    weights = weights / np.sum(weights)
-
-    terminal_values = np.zeros(Z_fixed.shape[0])
-
-    for m in range(Z_fixed.shape[0]):
-        dailyReturns = meanReturns.values + Z_fixed[m] @ L.T
-        portfolio_path = np.cumprod(dailyReturns @ weights + 1) * initialPortfolio
-        terminal_values[m] = portfolio_path[-1]
-
-    portResults = pd.Series(terminal_values)
-
-    expected_WT = portResults.mean()
-    cvar_wealth = mcCVaR(portResults, alpha=5)
-    cvar_loss = initialPortfolio - cvar_wealth
-
-    return -(expected_WT - lam * cvar_loss)
-
-def Sharpe_Objective(weights, meanReturns, L, Z_fixed, initialPortfolio, rf=0.04):
+def simulate_terminal_values(weights, meanReturns, L, Z_fixed, initialPortfolio):
     """
-    Monte Carlo Sharpe ratio objective.
+    Simulate terminal portfolio values across all Monte Carlo paths.
 
     Parameters
     ----------
@@ -34,31 +14,58 @@ def Sharpe_Objective(weights, meanReturns, L, Z_fixed, initialPortfolio, rf=0.04
     L : np.ndarray
         Cholesky factor of covariance matrix.
     Z_fixed : np.ndarray
-        Fixed random shocks with shape (mc_sims, T, n_assets).
+        Random shocks with shape (mc_sims, T, n_assets).
     initialPortfolio : float
         Starting portfolio value.
-    rf : float
-        Risk-free return over the SAME horizon as the terminal return.
-        For example, if terminal return is over T days, rf should also be over T days.
 
     Returns
     -------
-    float
-        Negative Sharpe ratio for minimization.
+    np.ndarray
+        Terminal portfolio values of shape (mc_sims,).
     """
     weights = np.array(weights, dtype=float)
-    weights = np.clip(weights, 0, 1)
     weights = weights / np.sum(weights)
-
-    mc_sims = Z_fixed.shape[0]
-    terminal_values = np.zeros(mc_sims)
 
     mean_vec = meanReturns.values if hasattr(meanReturns, "values") else np.array(meanReturns)
 
-    for m in range(mc_sims):
-        dailyReturns = mean_vec + Z_fixed[m] @ L.T
-        portfolio_path = np.cumprod(dailyReturns @ weights + 1) * initialPortfolio
-        terminal_values[m] = portfolio_path[-1]
+    # Shape: (mc_sims, T, n_assets)
+    daily_returns = mean_vec[None, None, :] + Z_fixed @ L.T
+
+    # Shape: (mc_sims, T)
+    portfolio_returns = daily_returns @ weights
+
+    # Shape: (mc_sims,)
+    terminal_values = initialPortfolio * np.cumprod(1 + portfolio_returns, axis=1)[:, -1]
+
+    return terminal_values
+
+
+def CVaR_Ret_Objective(weights, meanReturns, L, Z_fixed, initialPortfolio, lam):
+    """
+    Objective that maximizes expected terminal wealth penalized by CVaR loss.
+    Returned as negative for minimization.
+    """
+    terminal_values = simulate_terminal_values(
+        weights, meanReturns, L, Z_fixed, initialPortfolio
+    )
+
+    portResults = pd.Series(terminal_values)
+
+    expected_WT = portResults.mean()
+    cvar_wealth = mcCVaR(portResults, alpha=5)
+    cvar_loss = initialPortfolio - cvar_wealth
+
+    return -(expected_WT - lam * cvar_loss)
+
+
+def Sharpe_Objective(weights, meanReturns, L, Z_fixed, initialPortfolio, rf=0.04):
+    """
+    Monte Carlo Sharpe ratio objective.
+    Returned as negative for minimization.
+    """
+    terminal_values = simulate_terminal_values(
+        weights, meanReturns, L, Z_fixed, initialPortfolio
+    )
 
     terminal_returns = (terminal_values / initialPortfolio) - 1.0
 
