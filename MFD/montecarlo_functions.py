@@ -8,13 +8,89 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 from optimize_functions import CVaR_Ret_Objective, Sharpe_Objective, mcVaR, mcCVaR
 
-def get_data(stocks, start, end):
-  stockData = yf.download(stocks, start, end, auto_adjust=False)
-  stockData = stockData['Close']
-  returns = stockData.pct_change().dropna()
-  meanReturns = returns.mean()
-  covMatrix = returns.cov()
-  return meanReturns, covMatrix
+def get_data(stocks, start, end, print_stats=True):
+    stockData = yf.download(stocks, start=start, end=end, auto_adjust=False)
+
+    close = stockData['Close']
+    returns = close.pct_change().dropna()
+
+    meanReturns = returns.mean()
+    covMatrix = returns.cov()
+
+    if print_stats:
+
+        print("\n" + "=" * 50)
+        print("           DATA DIAGNOSTICS")
+        print("=" * 50)
+
+        daily_mean = returns.mean()
+        annual_mean = daily_mean * 252
+        daily_vol = returns.std()
+        annual_vol = daily_vol * np.sqrt(252)
+        sharpe = annual_mean / annual_vol
+
+        return_df = pd.DataFrame({
+            "Mean Daily Return": daily_mean,
+            "Annual Return": annual_mean,
+            "Annual Volatility": annual_vol,
+            "Sharpe Ratio": sharpe
+        })
+
+        print("\n--- RETURN STATS ---")
+        return_df_print = return_df.copy()
+        return_df_print["Mean Daily Return"] = return_df_print["Mean Daily Return"].map(lambda x: f"{x:.4%}")
+        return_df_print["Annual Return"] = return_df_print["Annual Return"].map(lambda x: f"{x:.2%}")
+        return_df_print["Annual Volatility"] = return_df_print["Annual Volatility"].map(lambda x: f"{x:.2%}")
+        return_df_print["Sharpe Ratio"] = return_df_print["Sharpe Ratio"].map(lambda x: f"{x:.3f}")
+        print(return_df_print)
+
+        dividend_data = []
+
+        for stock in stocks:
+            ticker = yf.Ticker(stock)
+            divs = ticker.dividends
+
+            if divs.index.tz is not None:
+                divs.index = divs.index.tz_localize(None)
+
+            divs = divs[(divs.index >= start) & (divs.index <= end)]
+
+            if len(divs) == 0:
+                dividend_yield = 0.0
+            else:
+                total_div = divs.sum()
+                avg_price = close[stock].mean()
+                dividend_yield = total_div / avg_price
+
+            dividend_data.append(dividend_yield)
+
+        dividend_df = pd.DataFrame({
+            "Dividend Yield": dividend_data
+        }, index=stocks)
+
+        print("\n--- DIVIDEND STATS ---")
+        dividend_df_print = dividend_df.copy()
+        dividend_df_print["Dividend Yield"] = dividend_df_print["Dividend Yield"].map(lambda x: f"{x:.2%}")
+        print(dividend_df_print)
+
+        max_dd_list = []
+
+        for stock in stocks:
+            price_series = close[stock]
+            running_max = price_series.cummax()
+            drawdown = (price_series - running_max) / running_max
+            max_dd_list.append(drawdown.min())
+
+        risk_df = pd.DataFrame({
+            "Max Drawdown": max_dd_list
+        }, index=stocks)
+
+        print("\n--- RISK STATS ---")
+        risk_df_print = risk_df.copy()
+        risk_df_print["Max Drawdown"] = risk_df_print["Max Drawdown"].map(lambda x: f"{x:.2%}")
+        print(risk_df_print)
+
+    return meanReturns, covMatrix
 
 def print_portfolio_stats(portfolio_sims, initialPortfolio, alpha=5, rf=0.04, print_stats=True):
     portResults = pd.Series(portfolio_sims[-1, :])
@@ -88,7 +164,7 @@ def plot_portfolio_results(portfolio_sims, initialPortfolio, percentile_line, me
     plt.legend()
     plt.show()
 
-def MonteCarlo(initial_portfolio, stock_tickers, weights, projection_len=365,
+def MonteCarlo(initial_portfolio, stock_tickers, weights='random', projection_len=365,
                t0=None, look_back=365, alpha=5, num_sims=1000,
                min_allocation=0, max_allocation=40,
                optimize=False, method="CVaR", show_stats=True,
@@ -118,7 +194,9 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights, projection_len=365,
 
     # ---------------- DATA ----------------
     pbar.set_postfix_str("downloading data")
-    meanReturns, covMatrix = get_data(stock_tickers, start_date, t0)
+    pbar.clear()
+    meanReturns, covMatrix = get_data(stock_tickers, start_date, t0, show_stats)
+    pbar.refresh()
     pbar.update(1)
 
     # ---------------- PREP ----------------
@@ -193,7 +271,7 @@ def MonteCarlo(initial_portfolio, stock_tickers, weights, projection_len=365,
         stats = print_portfolio_stats(portfolio_sims, initial_portfolio, alpha=alpha, print_stats=False)
         pbar.update(1)
         print("\n" + "="*35)
-        print("     OPTIMAL PORTFOLIO")
+        print("     PORTFOLIO WEIGHTS")
         print("="*35)
 
         for stock, w in zip(stock_tickers, weights):
