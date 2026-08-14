@@ -10,7 +10,7 @@ from optimize_functions import CVaR_Ret_Objective, Sharpe_Objective, mcVaR, mcCV
 def get_data(stocks, start, end, print_stats=True):
     stockData = yf.download(stocks, start=start, end=end, auto_adjust=False)
 
-    close = stockData['Close']
+    close = stockData['Adj Close']
     returns = close.pct_change().dropna()
 
     meanReturns = returns.mean()
